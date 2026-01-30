@@ -559,14 +559,28 @@ defmodule ReqLLM.Providers.Google do
   end
 
   @impl ReqLLM.Provider
-  def extract_usage(body, _model) when is_map(body) do
+  def extract_usage(body, model) when is_map(body) do
     case body do
       %{"usageMetadata" => usage_metadata} ->
         usage = normalize_google_usage(usage_metadata)
+        tool_usage = google_tool_usage(body, model)
+        image_usage = google_image_usage(body)
+
+        usage =
+          usage
+          |> Map.put(:tool_usage, tool_usage)
+          |> maybe_put_image_usage(image_usage)
+
         {:ok, usage}
 
       _ ->
-        {:error, :no_usage_found}
+        image_usage = google_image_usage(body)
+
+        if map_size(image_usage) > 0 do
+          {:ok, %{image_usage: image_usage}}
+        else
+          {:error, :no_usage_found}
+        end
     end
   end
 
@@ -592,6 +606,53 @@ defmodule ReqLLM.Providers.Google do
       reasoning_tokens: reasoning,
       add_reasoning_to_cost: true
     }
+  end
+
+  defp google_tool_usage(body, model) do
+    queries =
+      body
+      |> Map.get("candidates", [])
+      |> Enum.flat_map(fn candidate ->
+        case get_in(candidate, ["groundingMetadata", "webSearchQueries"]) do
+          queries when is_list(queries) -> queries
+          _ -> []
+        end
+      end)
+
+    if queries == [] do
+      %{}
+    else
+      unit = ReqLLM.Pricing.tool_unit(model, :web_search)
+
+      count =
+        case unit do
+          :query -> length(queries)
+          "query" -> length(queries)
+          _ -> 1
+        end
+
+      ReqLLM.Usage.Tool.build(:web_search, count, unit)
+    end
+  end
+
+  defp google_image_usage(body) when is_map(body) do
+    candidates = Map.get(body, "candidates", [])
+
+    count =
+      Enum.reduce(candidates, 0, fn candidate, acc ->
+        parts = get_in(candidate, ["content", "parts"]) || []
+        acc + ReqLLM.Usage.Image.count_inline_parts(parts)
+      end)
+
+    ReqLLM.Usage.Image.build_generated(count)
+  end
+
+  defp maybe_put_image_usage(usage, image_usage) do
+    if map_size(image_usage) > 0 do
+      Map.put(usage, :image_usage, image_usage)
+    else
+      usage
+    end
   end
 
   def pre_validate_options(_operation, model, opts) do
@@ -1054,15 +1115,14 @@ defmodule ReqLLM.Providers.Google do
             {req, %{resp | body: normalized}}
 
           :image when not is_streaming ->
-            model_name = req.options[:model]
+            model_name = ReqLLM.ModelId.normalize(req.options[:model], "google")
             body = ensure_parsed_body(resp.body)
             merged_response = decode_image_response(req, model_name, body)
             {req, %{resp | body: merged_response}}
 
           :object when not is_streaming ->
-            model_name = req.options[:model]
-            model = %LLMDB.Model{id: model_name, provider: :google}
-
+            model_name = ReqLLM.ModelId.normalize(req.options[:model], "google")
+            model = LLMDB.Model.new!(%{id: model_name, provider: :google})
             body = ensure_parsed_body(resp.body)
 
             openai_format = convert_google_json_mode_to_openai_format(body)
@@ -1070,7 +1130,6 @@ defmodule ReqLLM.Providers.Google do
             {:ok, response} =
               ReqLLM.Provider.Defaults.decode_response_body_openai_format(openai_format, model)
 
-            # Extract and set object from JSON text content (like OpenAI json_schema mode)
             response_with_object =
               case ReqLLM.Response.unwrap_object(response) do
                 {:ok, object} -> %{response | object: object}
@@ -1089,8 +1148,8 @@ defmodule ReqLLM.Providers.Google do
             ReqLLM.Provider.Defaults.default_decode_response({req, resp})
 
           _ ->
-            model_name = req.options[:model]
-            model = %LLMDB.Model{id: model_name, provider: :google}
+            model_name = ReqLLM.ModelId.normalize(req.options[:model], "google")
+            model = LLMDB.Model.new!(%{id: model_name, provider: :google})
 
             body = ensure_parsed_body(resp.body)
 
@@ -1104,17 +1163,26 @@ defmodule ReqLLM.Providers.Google do
               ReqLLM.Provider.Defaults.decode_response_body_openai_format(openai_format, model)
 
             response_with_reasoning = attach_reasoning_details(response, reasoning_details)
+            tool_usage = google_tool_usage(body, model)
+            image_usage = google_image_usage(body)
+
+            response_with_usage =
+              add_usage_details(response_with_reasoning, tool_usage, image_usage)
 
             response_with_grounding =
               case grounding_metadata do
                 nil ->
-                  response_with_reasoning
+                  response_with_usage
 
                 grounding_data ->
                   %{
-                    response_with_reasoning
+                    response_with_usage
                     | provider_meta:
-                        Map.put(response_with_reasoning.provider_meta, "google", grounding_data)
+                        Map.put(
+                          response_with_usage.provider_meta,
+                          "google",
+                          grounding_data
+                        )
                   }
               end
 
@@ -1152,8 +1220,12 @@ defmodule ReqLLM.Providers.Google do
     usage =
       case Map.get(body, "usageMetadata") do
         usage_metadata when is_map(usage_metadata) -> normalize_google_usage(usage_metadata)
-        _ -> nil
+        _ -> %{}
       end
+
+    image_usage = google_image_usage(body)
+    usage = maybe_put_image_usage(usage, image_usage)
+    usage = if usage != %{}, do: usage
 
     base_response = %ReqLLM.Response{
       id: image_response_id(),
@@ -1209,6 +1281,25 @@ defmodule ReqLLM.Providers.Google do
 
   defp image_response_id do
     "img_" <> (:crypto.strong_rand_bytes(12) |> Base.url_encode64(padding: false))
+  end
+
+  defp add_usage_details(%ReqLLM.Response{} = response, tool_usage, image_usage) do
+    usage = response.usage
+
+    usage =
+      if map_size(tool_usage) > 0 do
+        Map.put(usage, :tool_usage, tool_usage)
+      else
+        usage
+      end
+
+    usage = maybe_put_image_usage(usage, image_usage)
+
+    if usage == %{} do
+      response
+    else
+      %{response | usage: usage}
+    end
   end
 
   # Helper to build Google toolConfig from OpenAI-style tool_choice
@@ -1360,7 +1451,8 @@ defmodule ReqLLM.Providers.Google do
     }
   end
 
-  defp convert_google_to_openai_format(body), do: body
+  defp convert_google_to_openai_format(body) when is_map(body), do: body
+  defp convert_google_to_openai_format(_body), do: %{}
 
   defp convert_google_json_mode_to_openai_format(%{"candidates" => candidates} = body) do
     choice =
@@ -1395,7 +1487,8 @@ defmodule ReqLLM.Providers.Google do
     }
   end
 
-  defp convert_google_json_mode_to_openai_format(body), do: body
+  defp convert_google_json_mode_to_openai_format(body) when is_map(body), do: body
+  defp convert_google_json_mode_to_openai_format(_body), do: %{}
 
   defp convert_google_parts_to_content(parts) do
     content_parts =

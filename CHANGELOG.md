@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-02-01
+
+### Added
+
+- `ToolCall.from_map/1` and `ToolCall.to_map/1` for normalized tool call handling (#396)
+
+### Fixed
+
+- Move git_ops config outside dev-only block to fix CI release workflow
+
 ## [1.4.0] - 2026-01-30
 
 ### Added

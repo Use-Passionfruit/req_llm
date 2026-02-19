@@ -327,6 +327,9 @@ defmodule ReqLLM.StreamResponse do
                        Signature: `(String.t() -> any())`
       * `:on_thinking` - Callback invoked immediately for each `:thinking` chunk.
                         Signature: `(String.t() -> any())`
+      * `:on_tool_call` - Callback invoked immediately for each `:tool_call` chunk.
+                         Receives the full `StreamChunk` struct.
+                         Signature: `(StreamChunk.t() -> any())`
 
   ## Returns
 
@@ -410,6 +413,9 @@ defmodule ReqLLM.StreamResponse do
         :thinking ->
           if callbacks.on_thinking && chunk.text, do: callbacks.on_thinking.(chunk.text)
 
+        :tool_call ->
+          if callbacks.on_tool_call, do: callbacks.on_tool_call.(chunk)
+
         _ ->
           :ok
       end
@@ -422,7 +428,8 @@ defmodule ReqLLM.StreamResponse do
   defp extract_callbacks(opts) do
     %{
       on_result: Keyword.get(opts, :on_result),
-      on_thinking: Keyword.get(opts, :on_thinking)
+      on_thinking: Keyword.get(opts, :on_thinking),
+      on_tool_call: Keyword.get(opts, :on_tool_call)
     }
   end
 
@@ -474,7 +481,7 @@ defmodule ReqLLM.StreamResponse do
 
   ## Returns
 
-  An atom indicating the finish reason (`:stop`, `:length`, `:tool_use`, etc.) or nil.
+  An atom indicating the finish reason (`:stop`, `:length`, `:tool_calls`, etc.) or nil.
 
   ## Examples
 
@@ -494,13 +501,51 @@ defmodule ReqLLM.StreamResponse do
 
     case metadata do
       %{finish_reason: finish_reason} when is_atom(finish_reason) ->
-        finish_reason
+        normalize_finish_reason(finish_reason)
 
       %{finish_reason: finish_reason} when is_binary(finish_reason) ->
-        String.to_existing_atom(finish_reason)
+        normalize_finish_reason(finish_reason)
 
       _ ->
         nil
+    end
+  end
+
+  defp normalize_finish_reason(reason) when is_atom(reason) do
+    case reason do
+      :tool_use -> :tool_calls
+      :completed -> :stop
+      :end_turn -> :stop
+      :max_tokens -> :length
+      :max_output_tokens -> :length
+      :stop -> :stop
+      :tool_calls -> :tool_calls
+      :length -> :length
+      :content_filter -> :content_filter
+      :error -> :error
+      :cancelled -> :cancelled
+      :incomplete -> :incomplete
+      :unknown -> :unknown
+      _ -> :unknown
+    end
+  end
+
+  defp normalize_finish_reason(reason) when is_binary(reason) do
+    case reason do
+      "stop" -> :stop
+      "completed" -> :stop
+      "tool_calls" -> :tool_calls
+      "tool_use" -> :tool_calls
+      "length" -> :length
+      "max_tokens" -> :length
+      "max_output_tokens" -> :length
+      "content_filter" -> :content_filter
+      "end_turn" -> :stop
+      "error" -> :error
+      "cancelled" -> :cancelled
+      "incomplete" -> :incomplete
+      "unknown" -> :unknown
+      _ -> :unknown
     end
   end
 
